@@ -1,0 +1,12 @@
+id = "stgerman.claude-memories"
+name = "Claude Memories"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Surface and curate Claude Code auto-memory from inside herdr"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/fetch-binary.sh"]
+
+[[startup]]
+command = ["bin/herdr-claude-memories", "reconcile"]
