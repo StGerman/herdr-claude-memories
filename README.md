@@ -34,6 +34,15 @@ path is the design, not an omission.
 Early. `docs/DESIGN.md` is settled; the code is landing behind it. Each open
 issue is one user story with its implementation RFC.
 
+| | |
+|---|---|
+| Toast on memory write | landed |
+| Hook installation (`reconcile`) | landed |
+| Store resolution | [#3](https://github.com/StGerman/herdr-claude-memories/issues/3) |
+| Doctor panel | [#4](https://github.com/StGerman/herdr-claude-memories/issues/4) |
+| Dreams | [#5](https://github.com/StGerman/herdr-claude-memories/issues/5) |
+| Review and adoption | [#6](https://github.com/StGerman/herdr-claude-memories/issues/6) |
+
 ## Install
 
 ```bash
