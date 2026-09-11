@@ -1,0 +1,7 @@
+# Pinned so a local checkout and CI agree on a compiler.
+#
+# They did not: `stable` on the author's machine sat at 1.80.1 for two years
+# while CI used whatever the runner shipped, and the gap only surfaced when a
+# dependency refused to build in one place and not the other.
+[toolchain]
+channel = "1.98.1"
