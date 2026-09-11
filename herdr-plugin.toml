@@ -10,3 +10,15 @@ command = ["sh", "scripts/fetch-binary.sh"]
 
 [[startup]]
 command = ["bin/herdr-claude-memories", "reconcile"]
+
+[[panes]]
+id = "doctor"
+title = "Claude memories"
+placement = "overlay"
+command = ["bin/herdr-claude-memories", "panel"]
+
+[[actions]]
+id = "doctor"
+title = "Claude memory corpus"
+contexts = ["global"]
+command = ["bin/herdr-claude-memories", "panel-open"]

@@ -1,14 +1,16 @@
 //! herdr-claude-memories — surface and curate Claude Code auto-memory in herdr.
 //!
-//! Four subcommands, one binary, no library crate. See `docs/DESIGN.md` for
-//! why each of them behaves the way it does.
+//! One binary, no library crate. See `docs/DESIGN.md` for why each subcommand
+//! behaves the way it does.
 //!
 //! * `reconcile` — install this plugin's hook into `~/.claude/settings.json`.
 //!   Runs from `[[startup]]` on every herdr server start, so it must be
 //!   idempotent and must never fail the server.
 //! * `notify` — the `PostToolUse` hook body. Reads the hook payload on stdin
 //!   and fires a herdr toast when a memory topic file is written.
-//! * `panel` — the read-only doctor overlay.
+//! * `panel` — the read-only machine-wide corpus overlay.
+//! * `panel-open` — ask herdr to open that overlay. An action, not a pane,
+//!   because a keybinding can only reach a pane through one.
 //! * `resolve` — print the store/repository index. Undocumented and absent
 //!   from the manifest: it exists to exercise `resolution` against a real
 //!   `~/.claude` and to debug the panel and the dream.
@@ -22,6 +24,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod panel;
 mod resolution;
 
 /// Tool names whose writes can land in a memory store.
@@ -50,10 +53,8 @@ fn main() -> ExitCode {
         "reconcile" => run_reconcile(),
         "notify" => run_notify(),
         "resolve" => run_resolve(&std::env::args().skip(2).collect::<Vec<_>>()),
-        "panel" => {
-            eprintln!("herdr-claude-memories: panel is not implemented yet");
-            ExitCode::SUCCESS
-        }
+        "panel" => panel::run(&config_dir()),
+        "panel-open" => panel::run_open(),
         other => {
             eprintln!("herdr-claude-memories: unknown command '{other}'");
             usage();
@@ -63,7 +64,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    eprintln!("usage: herdr-claude-memories <reconcile|notify|panel|resolve>");
+    eprintln!("usage: herdr-claude-memories <reconcile|notify|panel|panel-open|resolve>");
 }
 
 // ---------------------------------------------------------------------------
