@@ -160,8 +160,10 @@ checks only report what can be computed.
 Read `cwd` from each project directory's transcripts, resolve it with
 `git rev-parse --show-toplevel`, and group project directories by repository
 root. This is the only method that survives both the lossy slug and the
-worktree split. Stores whose transcripts are all swept are reported as
-unresolvable, which is itself a finding.
+worktree split. Stores whose transcripts are all swept resolve to nothing and
+are reported as unresolvable. That is an outcome of resolution, not yet a
+judgement: an unresolvable store *with memories in it* is a finding, and an
+unresolvable empty directory is listed and left alone.
 
 `--show-toplevel` inside a linked worktree answers with the *worktree* root, so
 grouping needs one more step: `--git-common-dir` names `<main>/.git`, whose

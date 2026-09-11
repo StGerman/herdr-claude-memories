@@ -10,9 +10,10 @@ written in one of the other four panes, and seeing the corpus as a whole.
 This plugin does both:
 
 - **A toast when a memory is saved,** naming the memory and the project it
-  belongs to. Several memories saved in one turn are coalesced into a single
-  notification, because herdr rate limits toasts to one per second and silently
-  drops the rest.
+  belongs to. herdr rate limits notifications to one per second and drops the
+  rest rather than queuing them, so a turn that saves several memories currently
+  raises one toast and loses the others — coalescing them into a single
+  notification is [#8](https://github.com/StGerman/herdr-claude-memories/issues/8).
 - **A machine-wide corpus pane** listing every memory store on your machine —
   which repository each belongs to, how many memories it holds, and how close
   its `MEMORY.md` is to the 200-line / 25 KB cap past which content is silently
