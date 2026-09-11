@@ -119,6 +119,23 @@ root. This is the only method that survives both the lossy slug and the
 worktree split. Stores whose transcripts are all swept are reported as
 unresolvable, which is itself a finding.
 
+`--show-toplevel` inside a linked worktree answers with the *worktree* root, so
+grouping needs one more step: `--git-common-dir` names `<main>/.git`, whose
+parent is the repository the store belongs to. A submodule's common directory
+is `<super>/.git/modules/<name>`, which does not match, so submodules keep
+their own root.
+
+**A `cwd` that no longer exists resolves to itself.** No ancestor is probed for
+a repository willing to adopt it. A deleted worktree therefore forms its own
+group rather than joining its parent — the price of never producing a
+wrong-but-plausible answer, and the same rule that forbids slug reversal.
+
+**The resolution cache is a pure memo.** An entry in
+`$HERDR_PLUGIN_STATE_DIR/resolution.json` is used only while the transcript
+that produced it is still there with the same mtime. Deleting the file changes
+nothing but speed, and a store whose evidence has been swept is never
+resurrected from it — that store is genuinely unresolvable now.
+
 ### Dreams
 
 Modelled on the Anthropic Dreams API contract, run locally.

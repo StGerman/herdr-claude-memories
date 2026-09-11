@@ -38,7 +38,7 @@ issue is one user story with its implementation RFC.
 |---|---|
 | Toast on memory write | landed |
 | Hook installation (`reconcile`) | landed |
-| Store resolution | [#3](https://github.com/StGerman/herdr-claude-memories/issues/3) |
+| Store resolution | landed |
 | Doctor panel | [#4](https://github.com/StGerman/herdr-claude-memories/issues/4) |
 | Dreams | [#5](https://github.com/StGerman/herdr-claude-memories/issues/5) |
 | Review and adoption | [#6](https://github.com/StGerman/herdr-claude-memories/issues/6) |
@@ -70,6 +70,7 @@ sh scripts/fetch-binary.sh              # what [[build]] runs
 herdr plugin link .
 herdr plugin unlink stgerman.claude-memories
 ./bin/herdr-claude-memories reconcile   # apply to a running server without restarting it
+./bin/herdr-claude-memories resolve     # which repository each memory store belongs to
 ```
 
 ## Requirements
