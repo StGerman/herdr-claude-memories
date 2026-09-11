@@ -8,7 +8,7 @@
 //!   idempotent and must never fail the server.
 //! * `notify` — the `PostToolUse` hook body. Reads the hook payload on stdin
 //!   and fires a herdr toast when a memory topic file is written.
-//! * `panel` — the read-only doctor overlay.
+//! * `panel` — the read-only machine-wide corpus overlay.
 //! * `resolve` — print the store/repository index. Undocumented and absent
 //!   from the manifest: it exists to exercise `resolution` against a real
 //!   `~/.claude` and to debug the panel and the dream.
