@@ -99,7 +99,9 @@ fn run_notify() -> ExitCode {
     };
 
     // The hook fires after the write, so the file exists and canonicalising it
-    // resolves a symlinked config directory before the prefix comparison.
+    // resolves any symlinks in the written path. That alone is not enough — see
+    // `is_memory_topic_file`, which canonicalises the roots it is compared
+    // against too.
     let path = PathBuf::from(file_path);
     let path = std::fs::canonicalize(&path).unwrap_or(path);
 
@@ -196,6 +198,11 @@ fn scalar(front: &str, key: &str) -> Option<String> {
 /// rather than by globbing, plus any store relocated with
 /// `autoMemoryDirectory`. Never a substring test on `/memory/`: plenty of
 /// repositories have a directory by that name.
+///
+/// Both sides of the comparison are canonicalised. The caller hands us a
+/// canonicalised path, and `$HOME` is a symlink on plenty of machines, so
+/// leaving the roots as written is what would make the prefix never match and
+/// no toast ever fire.
 fn is_memory_topic_file(path: &Path, config_dir: &Path, extra_roots: &[PathBuf]) -> bool {
     if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
         return false;
@@ -203,10 +210,14 @@ fn is_memory_topic_file(path: &Path, config_dir: &Path, extra_roots: &[PathBuf])
     if path.file_name().is_some_and(|name| name == INDEX_FILE) {
         return false;
     }
-    if extra_roots.iter().any(|root| path.starts_with(root)) {
+    if extra_roots
+        .iter()
+        .any(|root| path.starts_with(canonicalise(root)))
+    {
         return true;
     }
-    let Ok(rest) = path.strip_prefix(config_dir.join("projects")) else {
+    let projects = canonicalise(&config_dir.join("projects"));
+    let Ok(rest) = path.strip_prefix(projects) else {
         return false;
     };
     let mut parts = rest.components();
@@ -214,6 +225,13 @@ fn is_memory_topic_file(path: &Path, config_dir: &Path, extra_roots: &[PathBuf])
     parts
         .next()
         .is_some_and(|part| part.as_os_str() == "memory")
+}
+
+/// Resolve symlinks in a comparison root. A path that does not exist is kept
+/// exactly as given — `notify` must never fail, and a root that is merely
+/// misconfigured is not this function's problem to report.
+fn canonicalise(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn suppressed() -> bool {
@@ -445,6 +463,32 @@ mod tests {
         let root = PathBuf::from("/home/x/my-memories");
         let path = root.join("feedback_testing.md");
         assert!(is_memory_topic_file(&path, &config(), &[root]));
+    }
+
+    /// `$HOME` is a symlink on plenty of machines, and the hook canonicalises
+    /// the written path before this comparison — so the store's own root has
+    /// to be canonicalised too, or nothing ever matches and the toast is
+    /// silently dead.
+    #[test]
+    fn a_symlinked_config_directory_still_matches() {
+        let temp =
+            std::env::temp_dir().join(format!("herdr-memories-notify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let store = temp.join("real/.claude/projects/-Code-app/memory");
+        std::fs::create_dir_all(&store).expect("create store");
+        let memory = store.join("user_role.md");
+        std::fs::write(&memory, "---\nname: x\n---\n").expect("write memory");
+        std::os::unix::fs::symlink(temp.join("real"), temp.join("link")).expect("symlink");
+
+        // What `run_notify` has in hand: the written path, canonicalised.
+        let written = std::fs::canonicalize(&memory).expect("canonicalize");
+        let through_the_link = temp.join("link/.claude");
+        let matched = is_memory_topic_file(&written, &through_the_link, &[]);
+        let relocated = is_memory_topic_file(&written, &temp.join("nowhere"), &[store.clone()]);
+
+        let _ = std::fs::remove_dir_all(&temp);
+        assert!(matched, "a symlinked config directory must still match");
+        assert!(relocated, "so must a symlinked relocated store");
     }
 
     #[test]
