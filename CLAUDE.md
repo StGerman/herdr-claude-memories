@@ -68,8 +68,10 @@ so a missed, duplicated or out-of-order hook cannot desynchronise anything.
   Producing a wrong-but-plausible parent is the failure this whole module
   exists to avoid.
 - **The resolution cache is a memo, never a record.** An entry is valid only
-  while the transcript that produced it survives unchanged; once transcripts
-  are swept, the store is unresolvable and the cache must say so too.
+  while every fact behind it holds: the transcript that supplied the `cwd`
+  (which is not always the newest one), the newest transcript, whether the
+  `cwd` still exists, and the repository marker git answered from. A cached
+  answer that disagrees with `resolve --no-cache` is a bug, not a trade-off.
 - **A store's transcripts are not one directory's `*.jsonl`.** Worktrees get
   their own project directory for transcripts while memories stay in the parent
   repo's store. Group project directories by resolved repository root.

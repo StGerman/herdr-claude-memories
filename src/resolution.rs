@@ -33,7 +33,10 @@ const SCAN_LINES: usize = 200;
 const SCAN_BYTES: u64 = 256 * 1024;
 
 /// Bumped when the cache entry shape changes; an older file is simply ignored.
-const CACHE_VERSION: u64 = 1;
+///
+/// 2: entries record the transcript that supplied the `cwd` and the state git
+/// answered from, not just the newest transcript.
+const CACHE_VERSION: u64 = 2;
 
 /// Everything resolvable about the memory corpus on this machine.
 #[derive(Debug, Default)]
@@ -76,6 +79,47 @@ pub struct Transcript {
     pub len: u64,
 }
 
+/// One project directory's answer, together with what it rests on.
+///
+/// The cache stores exactly this, which is what lets it check its own work:
+/// every field here is a fact that can change independently of the others.
+#[derive(Debug, Clone)]
+struct Resolution {
+    cwd: PathBuf,
+    /// Whether that `cwd` was on disk when git was asked about it. A deleted
+    /// worktree is the case this catches.
+    cwd_existed: bool,
+    root: Root,
+    /// The transcript that actually supplied the `cwd` — not necessarily the
+    /// newest one, since a transcript can carry no `cwd` at all.
+    evidence: Stamp,
+}
+
+/// A repository root, and whether git or the fallback produced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Root {
+    path: PathBuf,
+    /// `false` when the `cwd` was outside any repository and resolved to
+    /// itself. Knowing which it was is what makes the answer re-checkable.
+    from_git: bool,
+}
+
+/// A file and the mtime it had when it was read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Stamp {
+    path: PathBuf,
+    mtime_ns: u64,
+}
+
+impl Stamp {
+    fn of(transcript: &Transcript) -> Stamp {
+        Stamp {
+            path: transcript.path.clone(),
+            mtime_ns: mtime_ns(transcript),
+        }
+    }
+}
+
 /// A store with no surviving evidence of which project wrote it.
 ///
 /// Reported rather than guessed: a confidently wrong project name is worse
@@ -99,13 +143,14 @@ pub fn cache_path() -> Option<PathBuf> {
 
 /// Scan every project directory, resolve each to a repository, and group.
 ///
-/// `cache` is a pure memo: an entry is used only while the transcript that
-/// produced it still exists with the same mtime, so deleting the file changes
-/// nothing but speed, and a swept store is never resurrected from it.
+/// `cache` is a memo, and an entry is used only while every fact the answer
+/// rested on is unchanged: the transcript that supplied the `cwd`, the newest
+/// transcript, whether that `cwd` still exists, and the repository marker git
+/// answered from. Deleting the file changes nothing but speed.
 pub fn index(config_dir: &Path, cache: Option<&Path>) -> Index {
     let loaded = cache.map(Cache::load).unwrap_or_default();
     let mut fresh = Cache::default();
-    let mut roots: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut roots: HashMap<PathBuf, Root> = HashMap::new();
     let mut groups: BTreeMap<PathBuf, Repo> = BTreeMap::new();
     let mut unresolved = Vec::new();
 
@@ -113,21 +158,16 @@ pub fn index(config_dir: &Path, cache: Option<&Path>) -> Index {
         let transcripts = transcripts(&dir);
         let store = store_dir(&dir);
 
-        let resolved = transcripts
-            .first()
-            .and_then(|newest| match loaded.hit(&dir, newest) {
-                Some(entry) => Some((entry.cwd.clone(), entry.repo_root.clone())),
-                None => {
-                    let cwd = transcripts.iter().find_map(|t| recorded_cwd(&t.path))?;
-                    let root = roots
-                        .entry(cwd.clone())
-                        .or_insert_with_key(|cwd| repo_root(cwd))
-                        .clone();
-                    Some((cwd, root))
-                }
-            });
+        let resolved = match loaded.hit(&dir, &transcripts) {
+            Some(entry) => Some(entry.resolution()),
+            // Only live resolutions seed the memo. A cache hit answers for its
+            // own project directory and no other: letting it seed this would
+            // hand a remembered root to a directory whose own evidence is
+            // fresh enough to ask git about.
+            None => resolve(&transcripts, &mut roots),
+        };
 
-        let Some((cwd, root)) = resolved else {
+        let Some(resolution) = resolved else {
             // Evidence gone, or none of it carries a `cwd`. Another project
             // directory resolving to the same repository does not rescue this
             // one: nothing links an orphan slug to a repository.
@@ -141,9 +181,10 @@ pub fn index(config_dir: &Path, cache: Option<&Path>) -> Index {
         };
 
         if let Some(newest) = transcripts.first() {
-            fresh.record(&dir, newest, &cwd, &root);
+            fresh.record(&dir, newest, &resolution);
         }
 
+        let root = resolution.root.path.clone();
         let repo = groups.entry(root.clone()).or_insert_with(|| Repo {
             root,
             stores: Vec::new(),
@@ -154,7 +195,7 @@ pub fn index(config_dir: &Path, cache: Option<&Path>) -> Index {
         }
         repo.project_dirs.push(ProjectDir {
             path: dir,
-            cwd,
+            cwd: resolution.cwd,
             transcripts,
         });
     }
@@ -196,13 +237,24 @@ pub fn configured_memory_roots(config_dir: &Path) -> Vec<PathBuf> {
 /// When it is set, Claude Code writes there *instead of* the default location,
 /// so the relocated directory replaces the store rather than joining it.
 fn relocate_store(repo: &mut Repo) {
-    let local = repo.root.join(".claude/settings.local.json");
-    let Some(dir) = auto_memory_directory(&local) else {
+    let Some(dir) = relocated_store(&repo.root) else {
         return;
     };
     if dir.is_dir() {
         repo.stores = vec![dir];
     }
+}
+
+/// Where a session running in `project_root` writes its memories, when that
+/// repository has moved its own store.
+///
+/// `notify` needs this as much as the index does: a session writing to a
+/// repository-scoped store writes nowhere near `<config>/projects`, so without
+/// this the toast for it never fires. Settings live beside the session's
+/// working directory, so this costs one read and never a subprocess — the hook
+/// runs inside the agent's turn.
+pub fn relocated_store(project_root: &Path) -> Option<PathBuf> {
+    auto_memory_directory(&project_root.join(".claude/settings.local.json"))
 }
 
 fn auto_memory_directory(settings: &Path) -> Option<PathBuf> {
@@ -305,12 +357,38 @@ fn recorded_cwd(path: &Path) -> Option<PathBuf> {
 /// A `cwd` outside any repository — or one that no longer exists — resolves to
 /// itself. Claude Code uses the working directory as the project root in that
 /// case too, and an honest self-reference beats a guessed parent.
-fn repo_root(cwd: &Path) -> PathBuf {
+fn repo_root(cwd: &Path) -> Root {
     let Some(toplevel) = git(cwd, &["rev-parse", "--show-toplevel"]) else {
-        return normalise(cwd);
+        return Root {
+            path: normalise(cwd),
+            from_git: false,
+        };
     };
     let toplevel = PathBuf::from(toplevel);
-    main_worktree(&toplevel).unwrap_or_else(|| normalise(&toplevel))
+    Root {
+        path: main_worktree(&toplevel).unwrap_or_else(|| normalise(&toplevel)),
+        from_git: true,
+    }
+}
+
+/// Read the `cwd` out of the newest transcript that carries one, and resolve it.
+///
+/// The memo spares a second `git rev-parse` for two project directories that
+/// record the same `cwd`.
+fn resolve(transcripts: &[Transcript], roots: &mut HashMap<PathBuf, Root>) -> Option<Resolution> {
+    let (evidence, cwd) = transcripts
+        .iter()
+        .find_map(|transcript| Some((transcript, recorded_cwd(&transcript.path)?)))?;
+    let root = roots
+        .entry(cwd.clone())
+        .or_insert_with_key(|cwd| repo_root(cwd))
+        .clone();
+    Some(Resolution {
+        cwd_existed: cwd.exists(),
+        cwd,
+        root,
+        evidence: Stamp::of(evidence),
+    })
 }
 
 /// The main repository behind a linked worktree.
@@ -354,7 +432,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// Resolve symlinks so `/tmp` and `/private/tmp` cannot split one repository
 /// into two groups. A path that no longer exists is kept exactly as recorded.
-fn normalise(path: &Path) -> PathBuf {
+pub fn normalise(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -374,12 +452,16 @@ struct Cache {
     entries: BTreeMap<String, CacheEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CacheEntry {
-    transcript: PathBuf,
-    mtime_ns: u64,
+    /// Invalidates when a newer transcript lands, so fresh evidence is read.
+    newest: Stamp,
+    /// Invalidates when the transcript that supplied the `cwd` is swept or
+    /// rewritten — which is not always the newest one.
+    evidence: Stamp,
     cwd: PathBuf,
-    repo_root: PathBuf,
+    cwd_existed: bool,
+    root: Root,
 }
 
 impl Cache {
@@ -395,21 +477,45 @@ impl Cache {
         }
     }
 
-    /// The cached resolution for a project directory, if the transcript that
-    /// produced it is still there, unchanged.
-    fn hit(&self, project_dir: &Path, newest: &Transcript) -> Option<&CacheEntry> {
+    /// The cached resolution for a project directory, if every fact it rests
+    /// on still holds.
+    ///
+    /// Re-running git on each hit would cost about as much as resolving from
+    /// scratch — the subprocess spawns are the expensive part — so instead
+    /// this re-checks the two pieces of state git's answer depended on: the
+    /// `cwd` it was asked about, and the repository marker it found. What it
+    /// cannot notice is a repository appearing or moving *under* an unchanged
+    /// `cwd`; `--no-cache`, or deleting the file, settles that.
+    fn hit(&self, project_dir: &Path, transcripts: &[Transcript]) -> Option<&CacheEntry> {
         let entry = self.entries.get(&key(project_dir))?;
-        (entry.transcript == newest.path && entry.mtime_ns == mtime_ns(newest)).then_some(entry)
+        let newest = transcripts.first()?;
+        if entry.newest != Stamp::of(newest) {
+            return None;
+        }
+        if !transcripts
+            .iter()
+            .any(|transcript| Stamp::of(transcript) == entry.evidence)
+        {
+            return None;
+        }
+        if entry.cwd.exists() != entry.cwd_existed {
+            return None;
+        }
+        if entry.root.from_git && !entry.root.path.join(".git").exists() {
+            return None;
+        }
+        Some(entry)
     }
 
-    fn record(&mut self, project_dir: &Path, newest: &Transcript, cwd: &Path, root: &Path) {
+    fn record(&mut self, project_dir: &Path, newest: &Transcript, resolution: &Resolution) {
         self.entries.insert(
             key(project_dir),
             CacheEntry {
-                transcript: newest.path.clone(),
-                mtime_ns: mtime_ns(newest),
-                cwd: cwd.to_path_buf(),
-                repo_root: root.to_path_buf(),
+                newest: Stamp::of(newest),
+                evidence: resolution.evidence.clone(),
+                cwd: resolution.cwd.clone(),
+                cwd_existed: resolution.cwd_existed,
+                root: resolution.root.clone(),
             },
         );
     }
@@ -442,12 +548,21 @@ fn mtime_ns(transcript: &Transcript) -> u64 {
         .unwrap_or_default()
 }
 
-impl PartialEq for CacheEntry {
+impl CacheEntry {
+    /// What this entry answers, once `hit` has established it still holds.
+    fn resolution(&self) -> Resolution {
+        Resolution {
+            cwd: self.cwd.clone(),
+            cwd_existed: self.cwd_existed,
+            root: self.root.clone(),
+            evidence: self.evidence.clone(),
+        }
+    }
+}
+
+impl PartialEq for Root {
     fn eq(&self, other: &Self) -> bool {
-        self.transcript == other.transcript
-            && self.mtime_ns == other.mtime_ns
-            && self.cwd == other.cwd
-            && self.repo_root == other.repo_root
+        self.path == other.path && self.from_git == other.from_git
     }
 }
 
@@ -645,6 +760,12 @@ mod tests {
 
         fn index(&self) -> Index {
             index(&self.config(), None)
+        }
+
+        fn cache(&self) -> PathBuf {
+            let path = self.root().join("state/resolution.json");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+            path
         }
     }
 
@@ -890,8 +1011,7 @@ mod tests {
         let pinned = UNIX_EPOCH + Duration::from_secs(1_000);
         touch(&transcript, pinned);
 
-        let cache = fixture.root().join("state/resolution.json");
-        std::fs::create_dir_all(cache.parent().expect("parent")).expect("state dir");
+        let cache = fixture.cache();
         assert_eq!(index(&fixture.config(), Some(&cache)).repos[0].root, first);
         assert!(cache.exists());
 
@@ -905,6 +1025,96 @@ mod tests {
         assert_eq!(index(&fixture.config(), Some(&cache)).repos[0].root, second);
     }
 
+    /// The transcript that supplies the `cwd` is not always the newest one, so
+    /// keying the entry on the newest alone would let a cache hit outlive the
+    /// evidence underneath it and keep naming a repository nothing can prove.
+    #[test]
+    fn sweeping_the_evidence_invalidates_even_when_the_newest_is_unchanged() {
+        let fixture = Fixture::new();
+        let repo = fixture.dir("Code/app");
+        git_repo(&repo);
+        let project = fixture.dir(".claude/projects/-Code-app");
+        let store = fixture.store(&project);
+
+        // The newest transcript carries no `cwd`; an older one does.
+        let headerless = project.join("headerless.jsonl");
+        std::fs::write(&headerless, "{\"type\":\"queue-operation\"}\n").expect("write");
+        let evidence = fixture.transcript(&project, "evidence.jsonl", &repo);
+        touch(&headerless, UNIX_EPOCH + Duration::from_secs(2_000));
+        touch(&evidence, UNIX_EPOCH + Duration::from_secs(1_000));
+
+        let cache = fixture.cache();
+        assert_eq!(index(&fixture.config(), Some(&cache)).repos[0].root, repo);
+
+        // Sweep only the evidence. The newest transcript is untouched, so an
+        // entry keyed on it alone would still look valid.
+        std::fs::remove_file(&evidence).expect("sweep evidence");
+        let index = index(&fixture.config(), Some(&cache));
+        assert!(index.repos.is_empty(), "{:#?}", index.repos);
+        assert_eq!(index.unresolved.len(), 1);
+        assert_eq!(index.unresolved[0].store_dir, store);
+    }
+
+    /// Git topology changes without any transcript changing — a worktree gets
+    /// removed and its `cwd` stops existing. A cached answer that ignored that
+    /// would disagree with an uncached one, and the uncached one is right.
+    #[test]
+    fn a_removed_worktree_invalidates_its_cached_root() {
+        let fixture = Fixture::new();
+        let repo = fixture.dir("Code/app");
+        git_repo(&repo);
+        let worktree = repo.join(".claude/worktrees/wt");
+        git_at(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt",
+                worktree.to_str().expect("utf8"),
+            ],
+        );
+        fixture.project("-Code-app--claude-worktrees-wt", &worktree);
+
+        let cache = fixture.cache();
+        assert_eq!(
+            index(&fixture.config(), Some(&cache)).repos[0].root,
+            repo,
+            "a live worktree groups under its parent"
+        );
+
+        git_at(&repo, &["worktree", "remove", "--force", "wt"]);
+        let cached = index(&fixture.config(), Some(&cache));
+        let uncached = index(&fixture.config(), None);
+        assert_eq!(
+            cached.repos[0].root, worktree,
+            "resolves to itself once gone"
+        );
+        assert_eq!(
+            cached.repos[0].root, uncached.repos[0].root,
+            "the cache must never disagree with a cold scan"
+        );
+    }
+
+    /// The hook has to know about a repository-scoped relocated store too, or
+    /// a session whose store has moved writes memories nothing toasts for.
+    #[test]
+    fn a_repository_scope_relocated_store_is_visible_to_the_hook() {
+        let fixture = Fixture::new();
+        let repo = fixture.dir("Code/app");
+        let relocated = fixture.dir("Code/app-memories");
+        std::fs::create_dir_all(repo.join(".claude")).expect("claude dir");
+        std::fs::write(
+            repo.join(".claude/settings.local.json"),
+            serde_json::json!({ "autoMemoryDirectory": relocated }).to_string(),
+        )
+        .expect("write settings");
+
+        assert_eq!(relocated_store(&repo), Some(relocated));
+        assert_eq!(relocated_store(&fixture.dir("Code/plain")), None);
+    }
+
     /// The cache must never resurrect a store whose evidence has been swept.
     #[test]
     fn a_swept_transcript_drops_its_cache_entry() {
@@ -914,8 +1124,7 @@ mod tests {
         let project = fixture.project("-Code-app", &repo);
         let store = fixture.store(&project);
 
-        let cache = fixture.root().join("state/resolution.json");
-        std::fs::create_dir_all(cache.parent().expect("parent")).expect("state dir");
+        let cache = fixture.cache();
         assert_eq!(index(&fixture.config(), Some(&cache)).repos[0].root, repo);
 
         std::fs::remove_file(project.join("session.jsonl")).expect("sweep");
@@ -942,8 +1151,7 @@ mod tests {
         std::fs::write(&memory, "---\nname: x\n---\n").expect("write memory");
         let before = std::fs::metadata(&memory).expect("meta").modified().ok();
 
-        let cache = fixture.root().join("state/resolution.json");
-        std::fs::create_dir_all(cache.parent().expect("parent")).expect("state dir");
+        let cache = fixture.cache();
         index(&fixture.config(), Some(&cache));
 
         assert_eq!(

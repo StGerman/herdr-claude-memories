@@ -134,8 +134,18 @@ fn run_notify() -> ExitCode {
     let path = PathBuf::from(file_path);
     let path = std::fs::canonicalize(&path).unwrap_or(path);
 
+    // The payload's `cwd` is the session's project root, which is where a
+    // repository-scoped `autoMemoryDirectory` is configured. Without it, a
+    // session whose store has been moved would write memories this hook never
+    // recognises.
+    let cwd = payload
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from);
+
     let config_dir = config_dir();
-    let extra_roots = resolution::configured_memory_roots(&config_dir);
+    let mut extra_roots = resolution::configured_memory_roots(&config_dir);
+    extra_roots.extend(cwd.as_deref().and_then(resolution::relocated_store));
     if !is_memory_topic_file(&path, &config_dir, &extra_roots) {
         return ExitCode::SUCCESS;
     }
@@ -146,10 +156,9 @@ fn run_notify() -> ExitCode {
 
     // The payload carries `cwd`, so labelling the toast needs no slug
     // resolution. Resolving a store to its repository is a separate concern.
-    let project = payload
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .and_then(|cwd| Path::new(cwd).file_name())
+    let project = cwd
+        .as_deref()
+        .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "claude".to_string());
 
@@ -241,11 +250,11 @@ fn is_memory_topic_file(path: &Path, config_dir: &Path, extra_roots: &[PathBuf])
     }
     if extra_roots
         .iter()
-        .any(|root| path.starts_with(canonicalise(root)))
+        .any(|root| path.starts_with(resolution::normalise(root)))
     {
         return true;
     }
-    let projects = canonicalise(&config_dir.join("projects"));
+    let projects = resolution::normalise(&config_dir.join("projects"));
     let Ok(rest) = path.strip_prefix(projects) else {
         return false;
     };
@@ -254,13 +263,6 @@ fn is_memory_topic_file(path: &Path, config_dir: &Path, extra_roots: &[PathBuf])
     parts
         .next()
         .is_some_and(|part| part.as_os_str() == "memory")
-}
-
-/// Resolve symlinks in a comparison root. A path that does not exist is kept
-/// exactly as given — `notify` must never fail, and a root that is merely
-/// misconfigured is not this function's problem to report.
-fn canonicalise(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn suppressed() -> bool {
