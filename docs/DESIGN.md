@@ -119,6 +119,31 @@ root. This is the only method that survives both the lossy slug and the
 worktree split. Stores whose transcripts are all swept are reported as
 unresolvable, which is itself a finding.
 
+`--show-toplevel` inside a linked worktree answers with the *worktree* root, so
+grouping needs one more step: `--git-common-dir` names `<main>/.git`, whose
+parent is the repository the store belongs to. A submodule's common directory
+is `<super>/.git/modules/<name>`, which does not match, so submodules keep
+their own root.
+
+**A `cwd` that no longer exists resolves to itself.** No ancestor is probed for
+a repository willing to adopt it. A deleted worktree therefore forms its own
+group rather than joining its parent — the price of never producing a
+wrong-but-plausible answer, and the same rule that forbids slug reversal.
+
+**The resolution cache is a memo that checks its own work.** An entry in
+`$HERDR_PLUGIN_STATE_DIR/resolution.json` records every fact its answer rested
+on — the transcript that supplied the `cwd` (not merely the newest one, since a
+transcript can carry no `cwd` at all), the newest transcript, whether that `cwd`
+existed, and whether git or the fallback produced the root — and is used only
+while all of them still hold. Deleting the file changes nothing but speed, and a
+store whose evidence has been swept is never resurrected from it.
+
+Re-running git on every hit would cost as much as a cold scan — 120ms against
+this corpus, essentially all of it subprocess spawns — so the cache re-checks
+the *state* git answered from rather than re-asking it. The one drift it cannot
+notice is a repository appearing or moving under a `cwd` that itself never
+changed; `--no-cache` settles that, and so does deleting the file.
+
 ### Dreams
 
 Modelled on the Anthropic Dreams API contract, run locally.

@@ -1,6 +1,6 @@
 //! herdr-claude-memories — surface and curate Claude Code auto-memory in herdr.
 //!
-//! Three subcommands, one binary, no library crate. See `docs/DESIGN.md` for
+//! Four subcommands, one binary, no library crate. See `docs/DESIGN.md` for
 //! why each of them behaves the way it does.
 //!
 //! * `reconcile` — install this plugin's hook into `~/.claude/settings.json`.
@@ -9,6 +9,9 @@
 //! * `notify` — the `PostToolUse` hook body. Reads the hook payload on stdin
 //!   and fires a herdr toast when a memory topic file is written.
 //! * `panel` — the read-only doctor overlay.
+//! * `resolve` — print the store/repository index. Undocumented and absent
+//!   from the manifest: it exists to exercise `resolution` against a real
+//!   `~/.claude` and to debug the panel and the dream.
 //!
 //! A hook that fails is a hook that interrupts the agent's turn, so every path
 //! here exits `SUCCESS` unless the user asked for something that does not
@@ -18,6 +21,8 @@ use std::io::Read;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+mod resolution;
 
 /// Tool names whose writes can land in a memory store.
 ///
@@ -44,6 +49,7 @@ fn main() -> ExitCode {
     match command.as_str() {
         "reconcile" => run_reconcile(),
         "notify" => run_notify(),
+        "resolve" => run_resolve(&std::env::args().skip(2).collect::<Vec<_>>()),
         "panel" => {
             eprintln!("herdr-claude-memories: panel is not implemented yet");
             ExitCode::SUCCESS
@@ -57,7 +63,30 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    eprintln!("usage: herdr-claude-memories <reconcile|notify|panel>");
+    eprintln!("usage: herdr-claude-memories <reconcile|notify|panel|resolve>");
+}
+
+// ---------------------------------------------------------------------------
+// resolve
+// ---------------------------------------------------------------------------
+
+/// Print which repository every memory store belongs to, and what evidence
+/// says so.
+///
+/// `--json` for machines, `--no-cache` to prove the cache is only ever a
+/// memo — with and without it the answer must be identical.
+fn run_resolve(args: &[String]) -> ExitCode {
+    let cache = match args.iter().any(|arg| arg == "--no-cache") {
+        true => None,
+        false => resolution::cache_path(),
+    };
+    let index = resolution::index(&config_dir(), cache.as_deref());
+    if args.iter().any(|arg| arg == "--json") {
+        println!("{}", index.to_json());
+    } else {
+        print!("{}", index.render());
+    }
+    ExitCode::SUCCESS
 }
 
 // ---------------------------------------------------------------------------
@@ -105,8 +134,18 @@ fn run_notify() -> ExitCode {
     let path = PathBuf::from(file_path);
     let path = std::fs::canonicalize(&path).unwrap_or(path);
 
+    // The payload's `cwd` is the session's project root, which is where a
+    // repository-scoped `autoMemoryDirectory` is configured. Without it, a
+    // session whose store has been moved would write memories this hook never
+    // recognises.
+    let cwd = payload
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from);
+
     let config_dir = config_dir();
-    let extra_roots = configured_memory_roots(&config_dir);
+    let mut extra_roots = resolution::configured_memory_roots(&config_dir);
+    extra_roots.extend(cwd.as_deref().and_then(resolution::relocated_store));
     if !is_memory_topic_file(&path, &config_dir, &extra_roots) {
         return ExitCode::SUCCESS;
     }
@@ -117,10 +156,9 @@ fn run_notify() -> ExitCode {
 
     // The payload carries `cwd`, so labelling the toast needs no slug
     // resolution. Resolving a store to its repository is a separate concern.
-    let project = payload
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .and_then(|cwd| Path::new(cwd).file_name())
+    let project = cwd
+        .as_deref()
+        .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "claude".to_string());
 
@@ -212,11 +250,11 @@ fn is_memory_topic_file(path: &Path, config_dir: &Path, extra_roots: &[PathBuf])
     }
     if extra_roots
         .iter()
-        .any(|root| path.starts_with(canonicalise(root)))
+        .any(|root| path.starts_with(resolution::normalise(root)))
     {
         return true;
     }
-    let projects = canonicalise(&config_dir.join("projects"));
+    let projects = resolution::normalise(&config_dir.join("projects"));
     let Ok(rest) = path.strip_prefix(projects) else {
         return false;
     };
@@ -225,13 +263,6 @@ fn is_memory_topic_file(path: &Path, config_dir: &Path, extra_roots: &[PathBuf])
     parts
         .next()
         .is_some_and(|part| part.as_os_str() == "memory")
-}
-
-/// Resolve symlinks in a comparison root. A path that does not exist is kept
-/// exactly as given — `notify` must never fail, and a root that is merely
-/// misconfigured is not this function's problem to report.
-fn canonicalise(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn suppressed() -> bool {
@@ -359,7 +390,7 @@ fn ensure_hook(root: &mut serde_json::Value, matcher: &str, command: &str) -> bo
 
 /// Write via temp + rename in the same directory, so a crash mid-write cannot
 /// truncate a file several tools depend on.
-fn write_atomically(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+pub fn write_atomically(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let temp = parent.join(format!(".{}.tmp", file_name_of(path)));
@@ -388,32 +419,6 @@ fn config_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude")
-}
-
-/// Stores relocated with `autoMemoryDirectory`.
-///
-/// Globbing the default location alone is an incomplete scan by design: the
-/// setting is readable from any scope and moves a store wholesale.
-fn configured_memory_roots(config_dir: &Path) -> Vec<PathBuf> {
-    let Ok(raw) = std::fs::read_to_string(config_dir.join("settings.json")) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return Vec::new();
-    };
-    value
-        .get("autoMemoryDirectory")
-        .and_then(|dir| dir.as_str())
-        .map(expand_home)
-        .into_iter()
-        .collect()
-}
-
-fn expand_home(raw: &str) -> PathBuf {
-    match raw.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
-        None => PathBuf::from(raw),
-    }
 }
 
 #[cfg(test)]

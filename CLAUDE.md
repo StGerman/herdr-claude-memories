@@ -29,7 +29,8 @@ herdr plugin log list --plugin stgerman.claude-memories
 
 ## Architecture
 
-Three subcommands in a single binary (`src/main.rs`), no library crate.
+Four subcommands in a single binary (`src/main.rs`), no library crate.
+`src/resolution.rs` is the shared index the panel and the dream both read.
 
 ```
 Write/Edit ──▶ PostToolUse hook ──▶ `notify` ──▶ herdr notification show
@@ -40,6 +41,9 @@ herdr server start ──▶ [[startup]] ──▶ `reconcile` ──▶ setting
 keybinding / action ──▶ [[panes]] ───▶ `panel` ──▶ scans every memory store
                                                      │launches
                                               `claude` split pane (review)
+
+verification / debugging ─────────────▶ `resolve` ──▶ prints the same index
+                                       (not in the manifest)
 ```
 
 **Hooks are triggers, never carriers.** A hook says *when* to look; every fact
@@ -59,6 +63,15 @@ so a missed, duplicated or out-of-order hook cannot desynchronise anything.
   names are indistinguishable from path separators, so
   `-Users-x-Code-herdr-claude-tasks` has several readings and only one is real.
   Resolve through a transcript's `cwd` and `git rev-parse --show-toplevel`.
+- **A `cwd` that no longer exists resolves to itself.** No ancestor is probed
+  for a repository to adopt it, so a deleted worktree forms its own group.
+  Producing a wrong-but-plausible parent is the failure this whole module
+  exists to avoid.
+- **The resolution cache is a memo, never a record.** An entry is valid only
+  while every fact behind it holds: the transcript that supplied the `cwd`
+  (which is not always the newest one), the newest transcript, whether the
+  `cwd` still exists, and the repository marker git answered from. A cached
+  answer that disagrees with `resolve --no-cache` is a bug, not a trade-off.
 - **A store's transcripts are not one directory's `*.jsonl`.** Worktrees get
   their own project directory for transcripts while memories stay in the parent
   repo's store. Group project directories by resolved repository root.
