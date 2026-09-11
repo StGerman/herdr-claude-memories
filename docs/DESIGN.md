@@ -55,9 +55,26 @@ These are facts about Claude Code and herdr, verified on disk, not assumptions.
   A memory list in the sidebar is not buildable. Panes, actions, keybindings,
   link handlers and per-agent metadata tokens are.
 - **`herdr notification show` has no `--pane`.** A toast is global, so the
-  project name has to live in the title text. herdr suppresses popups for the
-  active tab, which is desirable here: you are only told about writes in
-  sessions you are not watching.
+  project name has to live in the title text.
+- **Active-tab suppression does not apply to this path.** `handle_notification_show`
+  never calls `active_tab_suppresses_notifications`; only the agent-state-change
+  paths do. A CLI notification has no pane association for the check to test, so
+  the toast fires even when you are watching the session that wrote the memory.
+  An earlier version of this document claimed the opposite and it was
+  load-bearing in the design conversation.
+- **Notifications are rate limited to one per second and the excess is dropped,**
+  not queued: a second call inside the window returns
+  `reason: "rate_limited", shown: false`. A third memory saved in the same turn
+  is silently missed. There is a second dropped case, `reason: "busy"`, when a
+  toast is already on screen.
+- **No memory carries a `modified` date.** Frontmatter is `name`, `description`,
+  `type` and `originSessionId`; newer Claude Code nests it as `metadata.type`.
+  Anything wanting a memory's age has no source for one.
+- **97.5% of a transcript is not conversation.** Measured across 26.5 MB: tool
+  calls, tool results and `attachment` records dominate, and `thinking` blocks
+  are 98.9% cryptographic `signature`. Prose, thinking text and compaction
+  summaries together are 1.5% of the bytes — the whole machine's history
+  reduces to roughly 101K tokens.
 
 ## Decisions
 
@@ -89,35 +106,64 @@ A `PostToolUse` hook on `Write|Edit` fires `herdr notification show` when a
 - A suppression lock under `HERDR_PLUGIN_STATE_DIR` silences the hook while a
   review is adopting changes, then one summary toast fires when it clears.
 
-### The panel is a read-only doctor
+**Writes are coalesced, because herdr drops the excess.** `notify` appends the
+memory's name to a pending file and spawns a detached flusher; the flusher
+sleeps past the rate-limit window, claims the batch by renaming the file — a
+losing racer finds nothing and exits — and fires one toast naming every memory
+in it. This is the only shape that fixes the drop without awaiting the child,
+and it turns the 1/sec limit from the bug into the batching interval: one
+logical save produces one toast even when it is three memories.
 
-An overlay pane that opens on what is *wrong* across every project rather than
-on a file tree. Deterministic checks only, no model involved:
+### The panel is the machine-wide corpus view
+
+An overlay pane listing every memory store on the machine, which is the one
+capability `/memory` structurally cannot offer. One row per repository: root,
+store, memory count, `MEMORY.md` size against the startup cap, and whether a
+dream proposal is waiting. It is also where a dream starts (`d`) and where a
+pending proposal is opened for review (`enter`).
+
+**It was specified as a doctor that opens on what is wrong, and the corpus
+refused to cooperate.** Audited across 8 stores: no broken index lines, no
+orphan topic files, no unresolvable stores, and the largest `MEMORY.md` at 1.8%
+of the 25 KB cap. Every check reported nothing. The checks are still worth
+having — they are insurance against a failure that is silent when it happens —
+but they are not what makes the pane worth opening today, so they became their
+own story.
+
+Deterministic checks only, no model involved, whenever they land:
 
 - **Index integrity** — `MEMORY.md` lines pointing at missing files, and topic
   files nothing points at.
 - **Load-cap pressure** — lines and bytes of each `MEMORY.md` against the
   200-line / 25 KB startup limit, with a warning band below it.
-- **Staleness and dead directories** — age from the `modified` frontmatter
-  field, and stores whose transcripts have all been swept so the project can no
-  longer be resolved.
+- **Dead directories** — stores with content whose transcripts have all been
+  swept, so the project can no longer be resolved.
 
-Staleness is a prompt to look, not a verdict. An old memory can still be true.
+**Staleness was dropped, not deferred.** It was specified as age from a
+`modified` frontmatter field that does not exist. File mtime answers "when did
+bytes change", not "is this belief old", so it is not a substitute.
+
+**An empty store is never a finding.** Five of eight stores are bare `memory/`
+directories. That is Claude Code creating a directory, not a defect, and the
+dead-store check must require content or every swept empty directory becomes a
+false alarm about nothing.
 
 Full scan when the overlay opens, `r` to rescan. The corpus is small; a scan is
 milliseconds and a watcher would be more machinery than the problem deserves.
 
 **The doctor is deterministic; the dream is semantic.** Detecting that a memory
 is misfiled *in substance* requires judgement and belongs to the dream. The
-doctor only reports what can be computed.
+checks only report what can be computed.
 
 ### Resolution
 
 Read `cwd` from each project directory's transcripts, resolve it with
 `git rev-parse --show-toplevel`, and group project directories by repository
 root. This is the only method that survives both the lossy slug and the
-worktree split. Stores whose transcripts are all swept are reported as
-unresolvable, which is itself a finding.
+worktree split. Stores whose transcripts are all swept resolve to nothing and
+are reported as unresolvable. That is an outcome of resolution, not yet a
+judgement: an unresolvable store *with memories in it* is a finding, and an
+unresolvable empty directory is listed and left alone.
 
 `--show-toplevel` inside a linked worktree answers with the *worktree* root, so
 grouping needs one more step: `--git-common-dir` names `<main>/.git`, whose
@@ -152,29 +198,72 @@ The real [Dreams API](https://platform.claude.com/docs/en/managed-agents/dreams)
 consumes managed `memstore_*` stores and `sesn_*` sessions — server-side
 resources that Claude Code's local memory directories and `*.jsonl` transcripts
 are not, with no documented import path. It is also gated behind the Managed
-Agents research preview plus a second beta header and billed separately.
+Agents research preview plus a second beta header, authenticated with an API key
+rather than Claude Code's own auth, and billed separately.
 
 What is worth stealing is the contract, and it is stolen exactly:
 
 > The input store is never modified. The dream produces a separate output
 > store. Review it, then adopt or discard.
 
-So: a real interactive Claude session, launched in a herdr pane, reads the
-live store plus new transcripts and writes a **shadow memory directory** to
-`HERDR_PLUGIN_STATE_DIR/dreams/<repo>/<timestamp>/`. The live store is never
+So: `claude -p` reads an extract of the transcripts plus every live store and
+writes **shadow memory directories** under
+`HERDR_PLUGIN_STATE_DIR/dreams/<repo>/<timestamp>/`. The live stores are never
 touched. `diff -r` is the entire review UI.
 
 - **Manual trigger only.** A dream spends real tokens and rewrites what shapes
   every future session. Idle, threshold and scheduled triggers are all
   addable later without redesign; none of them should be first.
-- **Incremental.** A watermark records how far the last dream read; each pass
-  mines only newer transcripts. The first pass reads a bounded recent window so
-  the most expensive run is also the most predictable.
 - **Cross-project moves and user-scope promotion are in scope.** A dream may
   propose relocating a memory to another repository's store, or promoting a
   genuinely global preference up to `~/.claude/CLAUDE.md`. This is what makes
-  fragmentation a fixable problem rather than a report. Reading every store to
-  do it is free — the whole corpus is kilobytes; only transcripts cost money.
+  fragmentation a fixable problem rather than a report.
+- **A dream may propose anything** — rewrite, merge, split, move, delete —
+  because the most common real defect is a memory that is 70% right and 30%
+  stale, which a move-or-delete-only dream cannot touch. Every entry carries the
+  original text, which is what keeps that reviewable.
+
+**Extraction, not a time window.** The first design bounded input to a recent
+window. That bounds nothing: every transcript on this machine is inside it, and
+`cleanupPeriodDays` retention is only 30 days. What actually bounds the input is
+throwing away the 97.5% of transcript bytes that are tool traffic and
+attachments. The plugin does that itself, deterministically, before the model
+sees anything — keeping prose, thinking text and compaction summaries, dropping
+synthetic `<tag>` blocks and `isMeta` records, since 60% of what looks like user
+text is the harness talking.
+
+**Which is why the dream is machine-wide and has no watermark.** At ~101K tokens
+for every transcript ever written, per-repository scoping buys nothing and costs
+the thing that matters: a dream scoped to repo A can propose moving a memory to
+B but can never notice that B already holds the duplicate. A watermark is a
+cache, and #3 already established that a stale memo is worse than a cheap
+recompute.
+
+**The extractor redacts credentials.** Transcripts contain whatever was ever
+pasted or printed into them — demonstrated live while designing this, when a
+shell command wrote a working OAuth token pair into one. Extraction is a
+deterministic pass over every byte and the only point where the plugin controls
+what leaves the machine. The pattern list grows and is never complete.
+
+**The dream's own auto-memory is redirected, not disabled.** A `claude -p`
+session would otherwise write into the stores it must not touch. Passing
+`--settings '{"autoMemoryDirectory": ...}'` sends it somewhere disposable, which
+is verified behaviour: with the override, the default store directory is not
+created and the override is. Two alternatives were tested and rejected —
+`--bare` disables auto-memory but forces API-key auth, which is the exact trade
+this design refused when it declined the real Dreams API; a sandboxed
+`CLAUDE_CONFIG_DIR` isolates perfectly but breaks subscription auth while
+**exiting 0**, so a dream would silently produce nothing and look successful.
+
+**The live stores are guarded by hashing, not by the prompt.** Every file is
+hashed before the dream launches and re-checked on exit; drift aborts the review
+and reports what changed. It is the check that catches the isolation mechanism
+failing.
+
+**The model is configuration, not design.** `config.json` in
+`HERDR_PLUGIN_CONFIG_DIR` holds one key, defaulting to `opus`, passed through to
+`claude --model` unchecked — it accepts aliases and full ids alike, and an
+allowlist shipped today would be wrong by the next model release.
 
 ### Review and adoption
 
@@ -200,13 +289,19 @@ this plugin exists to serve.
 
 ### Panes
 
-Panel opens as a zoomed **overlay** — browsing is something you open, read and
-close, and an overlay restores your previous focus and zoom on exit. The review
-opens as a **split**, because it is a real Claude session you may want to move,
-zoom, or leave running.
+The corpus pane opens as a zoomed **overlay** — browsing is something you open,
+read and close, and an overlay restores your previous focus and zoom on exit,
+which is herdr's behaviour rather than this plugin's. The dream and the review
+both open as a **split**, because each is a real Claude session you may want to
+move, zoom, or leave running.
 
 A popup was rejected: it has no pane id and is invisible to the pane, layout
-and persistence APIs, so the panel could never be scripted or restored.
+and persistence APIs, so the pane could never be scripted or restored.
+
+herdr actions run a process; they cannot open a pane declaratively, and a
+`[[keys.command]]` binding must name a `plugin_action`. A keybinding therefore
+reaches the pane through a small `panel-open` subcommand that calls back into
+`herdr plugin pane open`.
 
 ### Installation
 
@@ -227,5 +322,13 @@ produce a byte-identical file.
   and the plugin does not write to stores.
 - **Automatic dreaming.** Trigger stays manual until the proposals have earned
   trust.
+- **A complete record of memory changes.** The `PostToolUse` hook matches
+  `Write|Edit`, which is the path auto-memory actually uses — but a memory you
+  edit yourself through `/memory` and `$EDITOR`, or one a session writes with
+  `Bash`, is invisible to it. The toast is a notification, not an audit log.
+  Filesystem watching would be complete by construction, but herdr `[[startup]]`
+  hooks are one-shot initialisation commands with nowhere to supervise a daemon.
+- **Memory staleness.** No memory carries a date, and file mtime does not mean
+  what the check would need it to mean.
 - **Clickable `[[wikilinks]]`.** herdr link handlers match clicked *URLs* only,
   not arbitrary terminal text.

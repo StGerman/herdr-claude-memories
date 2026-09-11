@@ -9,14 +9,16 @@ written in one of the other four panes, and seeing the corpus as a whole.
 
 This plugin does both:
 
-- **A toast when a memory is saved.** herdr suppresses notifications for the
-  tab you are looking at, so you are only told about writes in sessions you are
-  *not* watching — which is exactly the ones you would otherwise miss.
-- **A read-only doctor panel**, machine-wide, that opens on what is structurally
-  wrong across every project's memory store: broken `MEMORY.md` index lines,
-  stores approaching the 200-line / 25 KB cap past which content is silently
-  dropped at session start, stale entries, and stores whose project can no
-  longer be resolved.
+- **A toast when a memory is saved,** naming the memory and the project it
+  belongs to. herdr rate limits notifications to one per second and drops the
+  rest rather than queuing them, so a turn that saves several memories currently
+  raises one toast and loses the others — coalescing them into a single
+  notification is [#8](https://github.com/StGerman/herdr-claude-memories/issues/8).
+- **A machine-wide corpus pane** listing every memory store on your machine —
+  which repository each belongs to, how many memories it holds, and how close
+  its `MEMORY.md` is to the 200-line / 25 KB cap past which content is silently
+  dropped at session start. `/memory` only ever shows the project you are
+  standing in.
 - **Dreams**, modelled on the [Anthropic Dreams
   API](https://platform.claude.com/docs/en/managed-agents/dreams) contract but
   run locally: a Claude session reads your store and new transcripts and writes
@@ -39,7 +41,8 @@ issue is one user story with its implementation RFC.
 | Toast on memory write | landed |
 | Hook installation (`reconcile`) | landed |
 | Store resolution | landed |
-| Doctor panel | [#4](https://github.com/StGerman/herdr-claude-memories/issues/4) |
+| Corpus pane | [#4](https://github.com/StGerman/herdr-claude-memories/issues/4) |
+| Structural checks | [#13](https://github.com/StGerman/herdr-claude-memories/issues/13) |
 | Dreams | [#5](https://github.com/StGerman/herdr-claude-memories/issues/5) |
 | Review and adoption | [#6](https://github.com/StGerman/herdr-claude-memories/issues/6) |
 
@@ -55,6 +58,11 @@ Or, for local development:
 git clone https://github.com/StGerman/herdr-claude-memories
 herdr plugin link ./herdr-claude-memories
 ```
+
+The toast tells you a memory was written; it is not an audit log. The hook
+matches the `Write` and `Edit` tools, which is how auto-memory actually saves —
+but a memory you edit yourself through `/memory` and `$EDITOR`, or one a session
+writes with `Bash`, will not raise one.
 
 First server start runs `reconcile`, which appends a `PostToolUse` hook to
 `~/.claude/settings.json`. It matches existing entries by exact command string

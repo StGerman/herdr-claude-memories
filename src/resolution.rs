@@ -1,7 +1,7 @@
 //! Resolve memory stores to repositories, and repositories to their transcripts.
 //!
-//! Two facts the filesystem does not state directly, and that both the doctor
-//! panel and the dream need: which repository a store belongs to, and which
+//! Two facts the filesystem does not state directly, and that both the corpus
+//! pane and the dream need: which repository a store belongs to, and which
 //! transcripts belong with it.
 //!
 //! Neither is derivable from the project directory name. The slug is lossy —
@@ -676,8 +676,8 @@ pub fn repo_transcripts(repo: &Repo) -> Vec<Transcript> {
 
 /// Distinct memory stores in this index, resolved and unresolved alike.
 ///
-/// The doctor checks every store it can find; whether its project has a name
-/// is a separate finding.
+/// The pane lists every store it can find; whether its project has a name is a
+/// separate fact about it, not a reason to omit it.
 pub fn all_stores(index: &Index) -> Vec<PathBuf> {
     let stores: BTreeSet<PathBuf> = index
         .repos
